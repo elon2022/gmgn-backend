@@ -4,17 +4,14 @@
 import json
 import os
 import subprocess
+import time
 from typing import Any
-
-# GMGN_CLI = os.environ.get(
-#     "GMGN_CLI",
-#     "/Users/liuyangyang/.local/share/fnm/node-versions/v24.14.0/installation/bin/gmgn-cli",
-# )
 
 GMGN_CLI = os.environ.get(
     "GMGN_CLI",
     "gmgn-cli",
 )
+
 
 class GMGNCliError(Exception):
     """gmgn-cli 调用或返回内容异常。"""
@@ -55,17 +52,27 @@ def token_info(chain: str, address: str) -> dict[str, Any]:
 
 
 def token_kline(
-    chain: str, address: str, resolution: str = "1h", limit: int = 200
+    chain: str,
+    address: str,
+    resolution: str = "1h",
+    hours: int = 168,   # 默认拉 7 天历史
 ) -> list[dict]:
-    data = _run(
-        [
-            "market", "kline",
-            "--chain", chain,
-            "--address", address,
-            "--resolution", resolution,
-            "--limit", str(limit),
-        ]
-    )
+    """
+    K 线。
+    cli 用 --from / --to 时间戳范围（秒），不支持 --limit。
+    返回每条形如：
+        {time(毫秒), open, high, low, close, volume(都是字符串)}
+    """
+    now = int(time.time())
+    from_ts = now - hours * 3600
+    data = _run([
+        "market", "kline",
+        "--chain", chain,
+        "--address", address,
+        "--resolution", resolution,
+        "--from", str(from_ts),
+        "--to", str(now),
+    ])
     if isinstance(data, list):
         return data
     return data.get("list") or data.get("klines") or []
@@ -74,17 +81,8 @@ def token_kline(
 def wallet_holdings(chain: str, address: str) -> list[dict]:
     """
     单个钱包的代币持仓列表。
-    返回每条形如：
-        {
-          "token": {"chain", "address", "symbol", "name", "logo"},
-          "balance": ...,
-          "usd_value": ...,
-          "price": ...
-        }
-    不同 cli 版本返回结构有差异，这里做最小兼容。
     """
     data = _run(["wallet", "holdings", "--chain", chain, "--address", address])
     if isinstance(data, list):
         return data
-    # 常见包装：{holdings: [...]} 或 {list: [...]}
     return data.get("holdings") or data.get("list") or []

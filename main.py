@@ -23,7 +23,7 @@ API_TOKEN = os.environ.get("API_TOKEN", "dev-token-change-me")
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "gmgn.db"
 
-app = FastAPI(title="GMGN Backend", version="0.3.0")
+app = FastAPI(title="GMGN Backend", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,6 +55,16 @@ def _normalize_pct(v: Any) -> float | None:
         return None
     f = float(v)
     return f * 100 if abs(f) <= 1 else f
+
+
+def _to_float(v: Any) -> float | None:
+    """gmgn-cli 部分字段（如 K 线 OHLC）是字符串，统一转 float。"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------- 健康检查 ----------
@@ -283,30 +293,52 @@ def token_detail(
 
 
 # ---------- K 线 ----------
+# 不同 resolution 默认拉的时间窗口：分辨率越细，时间窗口越短，避免一次返回上千根
+_RESOLUTION_HOURS: dict[str, int] = {
+    "1m": 6,        # 6 小时
+    "5m": 24,       # 1 天
+    "15m": 72,      # 3 天
+    "1h": 168,      # 7 天
+    "4h": 720,      # 30 天
+    "1d": 2160,     # 90 天
+}
+
+
 @app.get("/api/v1/token/{chain}/{address}/kline")
 def token_kline(
     chain: str,
     address: str,
     resolution: str = Query("1h"),
-    limit: int = Query(200, ge=10, le=500),
+    hours: int | None = Query(None, ge=1, le=24 * 365, description="向前回溯多少小时；不传按 resolution 默认"),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     require_auth(authorization)
 
+    if hours is None:
+        hours = _RESOLUTION_HOURS.get(resolution, 168)
+
     try:
-        candles = gmgn_client.token_kline(chain, address, resolution=resolution, limit=limit)
+        candles = gmgn_client.token_kline(chain, address, resolution=resolution, hours=hours)
     except gmgn_client.GMGNCliError as e:
         raise HTTPException(status_code=502, detail=f"upstream error: {e}")
 
     normalized = []
     for c in candles:
+        # cli 的 time 是毫秒；统一转成秒（iOS KlineCandle.ts 按秒处理）
+        raw_ts = c.get("time") or c.get("timestamp") or c.get("ts") or 0
+        try:
+            raw_ts_int = int(raw_ts)
+        except (TypeError, ValueError):
+            continue
+        ts_seconds = raw_ts_int // 1000 if raw_ts_int > 10_000_000_000 else raw_ts_int
+
         normalized.append({
-            "ts": c.get("timestamp") or c.get("time") or c.get("ts"),
-            "open":   c.get("open")   or c.get("o"),
-            "high":   c.get("high")   or c.get("h"),
-            "low":    c.get("low")    or c.get("l"),
-            "close":  c.get("close")  or c.get("c"),
-            "volume": c.get("volume") or c.get("v"),
+            "ts": ts_seconds,
+            "open":   _to_float(c.get("open")   or c.get("o")),
+            "high":   _to_float(c.get("high")   or c.get("h")),
+            "low":    _to_float(c.get("low")    or c.get("l")),
+            "close":  _to_float(c.get("close")  or c.get("c")),
+            "volume": _to_float(c.get("volume") or c.get("v")),
         })
 
     return {
@@ -329,13 +361,6 @@ def holdings_aggregate(
     req: HoldingsAggregateRequest,
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
-    """
-    聪明钱共识持仓。
-
-    返回 tokens[] 按"被多少个地址持有"降序排列，
-    每条包含：chain, address, symbol, name, logo_url,
-            holders_count, total_value_usd, holders[]
-    """
     require_auth(authorization)
 
     if len(req.addresses) > 100:
