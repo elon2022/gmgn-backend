@@ -2,9 +2,12 @@
 拉取 GMGN 热门榜并写入 SQLite。
 
 用法：
-    python3 refresh.py            # 默认 eth
-    python3 refresh.py eth        # 指定链
-    python3 refresh.py eth 5m 50  # 链 / 时段 / 数量
+    python3 refresh.py                  # 跑所有默认链 (eth, sol, bsc, base)
+    python3 refresh.py eth              # 只跑 eth
+    python3 refresh.py eth sol          # 只跑 eth 和 sol
+    python3 refresh.py all 1m 100       # 全部链 + 自定义 interval/limit
+
+systemd timer 调用：python3 refresh.py
 """
 import sqlite3
 import sys
@@ -16,6 +19,8 @@ import gmgn_client
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "gmgn.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
+
+DEFAULT_CHAINS = ["eth", "sol", "bsc", "base"]
 
 
 def init_db() -> sqlite3.Connection:
@@ -109,25 +114,96 @@ def _to_float(v) -> float | None:
         return None
 
 
-def refresh(chain: str = "eth", interval: str = "5m", limit: int = 50) -> int:
+def refresh_chain(
+    conn: sqlite3.Connection,
+    chain: str,
+    interval: str = "5m",
+    limit: int = 50,
+) -> int:
+    """
+    刷新单条链。失败抛异常，由调用方决定继续还是中止。
+    返回写入的代币数量。
+    """
     items = gmgn_client.trending(chain=chain, interval=interval, limit=limit)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    conn = init_db()
-    try:
-        for rank, item in enumerate(items, start=1):
-            upsert_token(conn, item, ts)
-            insert_snapshot(conn, item, ts, rank)
-        conn.commit()
-    finally:
-        conn.close()
+    for rank, item in enumerate(items, start=1):
+        upsert_token(conn, item, ts)
+        insert_snapshot(conn, item, ts, rank)
+    conn.commit()
 
-    print(f"[{ts}] saved {len(items)} tokens for chain={chain} interval={interval}")
+    print(f"[{ts}] [{chain}] saved {len(items)} tokens")
     return len(items)
 
 
+def refresh_all(
+    chains: list[str],
+    interval: str = "5m",
+    limit: int = 50,
+) -> dict[str, int | str]:
+    """
+    刷新多条链。某条链失败不影响其他链。
+    返回每条链的结果（成功是 int 数量，失败是错误字符串）。
+    """
+    conn = init_db()
+    results: dict[str, int | str] = {}
+    try:
+        for chain in chains:
+            try:
+                results[chain] = refresh_chain(conn, chain, interval, limit)
+            except Exception as e:
+                err = f"FAILED: {type(e).__name__}: {e}"
+                results[chain] = err
+                # 打 stderr 让 systemd 日志能抓到
+                print(f"[{chain}] {err}", file=sys.stderr)
+    finally:
+        conn.close()
+    return results
+
+
+# ---------- 兼容老接口（main.py 的手动刷新接口在用）----------
+def refresh(chain: str = "eth", interval: str = "5m", limit: int = 50) -> int:
+    """单链刷新（保留给 main.py 的 /api/v1/refresh 接口用）。"""
+    conn = init_db()
+    try:
+        return refresh_chain(conn, chain, interval, limit)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    chain = sys.argv[1] if len(sys.argv) > 1 else "eth"
-    interval = sys.argv[2] if len(sys.argv) > 2 else "5m"
-    limit = int(sys.argv[3]) if len(sys.argv) > 3 else 50
-    refresh(chain, interval, limit)
+    args = sys.argv[1:]
+
+    # 解析参数
+    if not args:
+        chains = DEFAULT_CHAINS
+        interval = "5m"
+        limit = 50
+    elif args[0] == "all":
+        chains = DEFAULT_CHAINS
+        interval = args[1] if len(args) > 1 else "5m"
+        limit = int(args[2]) if len(args) > 2 else 50
+    else:
+        # 把不是 interval/数字的参数当链名（支持 `python3 refresh.py eth sol`）
+        chains = []
+        rest = []
+        for a in args:
+            if a in {"1m", "5m", "15m", "1h", "4h", "1d"} or a.isdigit():
+                rest.append(a)
+            else:
+                chains.append(a)
+        if not chains:
+            chains = DEFAULT_CHAINS
+        interval = rest[0] if len(rest) >= 1 else "5m"
+        limit = int(rest[1]) if len(rest) >= 2 else 50
+
+    results = refresh_all(chains, interval=interval, limit=limit)
+
+    # 汇总输出
+    print("---- summary ----")
+    for chain, r in results.items():
+        print(f"  {chain}: {r}")
+
+    # 任一链失败 → 退出码非零，systemd 能看到
+    if any(isinstance(v, str) for v in results.values()):
+        sys.exit(1)
