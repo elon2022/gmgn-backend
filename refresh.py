@@ -1,5 +1,5 @@
 """
-拉取 GMGN 热门榜并写入 SQLite。
+拉取 GMGN 热门榜并写入 SQLite，刷新完后跑一次雷达扫描。
 
 用法：
     python3 refresh.py                  # 跑所有默认链 (eth, sol, bsc, base)
@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import gmgn_client
+import radar
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "gmgn.db"
@@ -25,6 +26,7 @@ DEFAULT_CHAINS = ["eth", "sol", "bsc", "base"]
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
     return conn
@@ -120,10 +122,6 @@ def refresh_chain(
     interval: str = "5m",
     limit: int = 50,
 ) -> int:
-    """
-    刷新单条链。失败抛异常，由调用方决定继续还是中止。
-    返回写入的代币数量。
-    """
     items = gmgn_client.trending(chain=chain, interval=interval, limit=limit)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -141,32 +139,43 @@ def refresh_all(
     interval: str = "5m",
     limit: int = 50,
 ) -> dict[str, int | str]:
-    """
-    刷新多条链。某条链失败不影响其他链。
-    返回每条链的结果（成功是 int 数量，失败是错误字符串）。
-    """
     conn = init_db()
     results: dict[str, int | str] = {}
+    success_chains: list[str] = []
     try:
         for chain in chains:
             try:
                 results[chain] = refresh_chain(conn, chain, interval, limit)
+                success_chains.append(chain)
             except Exception as e:
                 err = f"FAILED: {type(e).__name__}: {e}"
                 results[chain] = err
-                # 打 stderr 让 systemd 日志能抓到
                 print(f"[{chain}] {err}", file=sys.stderr)
+
+        # 所有链刷完之后跑雷达扫描（只扫成功刷新的链）
+        if success_chains:
+            scan_results = radar.scan_all_chains(conn, success_chains)
+            total_signals = sum(len(v) for v in scan_results.values())
+            if total_signals > 0:
+                print(f"---- radar: {total_signals} new signals ----")
+                for chain, signals in scan_results.items():
+                    for sig in signals:
+                        print(f"  [{chain}] {sig.get('symbol') or sig['address'][:10]}: {sig['trigger']}, MC=${sig['market_cap']:,.0f}")
+            else:
+                print("---- radar: no new signals ----")
     finally:
         conn.close()
     return results
 
 
-# ---------- 兼容老接口（main.py 的手动刷新接口在用）----------
 def refresh(chain: str = "eth", interval: str = "5m", limit: int = 50) -> int:
     """单链刷新（保留给 main.py 的 /api/v1/refresh 接口用）。"""
     conn = init_db()
     try:
-        return refresh_chain(conn, chain, interval, limit)
+        n = refresh_chain(conn, chain, interval, limit)
+        # 单链刷新也跑一次雷达
+        radar.scan_and_save(conn, chain)
+        return n
     finally:
         conn.close()
 
@@ -174,7 +183,6 @@ def refresh(chain: str = "eth", interval: str = "5m", limit: int = 50) -> int:
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    # 解析参数
     if not args:
         chains = DEFAULT_CHAINS
         interval = "5m"
@@ -184,7 +192,6 @@ if __name__ == "__main__":
         interval = args[1] if len(args) > 1 else "5m"
         limit = int(args[2]) if len(args) > 2 else 50
     else:
-        # 把不是 interval/数字的参数当链名（支持 `python3 refresh.py eth sol`）
         chains = []
         rest = []
         for a in args:
@@ -199,11 +206,9 @@ if __name__ == "__main__":
 
     results = refresh_all(chains, interval=interval, limit=limit)
 
-    # 汇总输出
     print("---- summary ----")
     for chain, r in results.items():
         print(f"  {chain}: {r}")
 
-    # 任一链失败 → 退出码非零，systemd 能看到
     if any(isinstance(v, str) for v in results.values()):
         sys.exit(1)

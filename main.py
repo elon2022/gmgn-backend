@@ -1,8 +1,5 @@
 """
 GMGN 后端 API 服务。
-
-启动：
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 import os
 import sqlite3
@@ -24,7 +21,7 @@ API_TOKEN = os.environ.get("API_TOKEN", "dev-token-change-me")
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "gmgn.db"
 
-app = FastAPI(title="GMGN Backend", version="0.4.0")
+app = FastAPI(title="GMGN Backend", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -172,18 +169,10 @@ def _find_comparison_snapshot(
     address: str,
     latest_ts: str,
 ) -> sqlite3.Row | None:
-    """
-    选取用于"温和吸筹"对比的历史快照。
-
-    策略（按优先级）：
-    1) 找一个 24h 前后 ±30 分钟的快照（理想情况）
-    2) 找最早的快照（数据不足 24h 时用）
-    """
     latest_dt = _parse_iso(latest_ts)
     if not latest_dt:
         return None
 
-    # 1) 试图找 24h 前的快照
     target_dt = latest_dt.timestamp() - 24 * 3600
     target_iso_lo = datetime.fromtimestamp(target_dt - 30 * 60, tz=latest_dt.tzinfo).isoformat(timespec="seconds")
     target_iso_hi = datetime.fromtimestamp(target_dt + 30 * 60, tz=latest_dt.tzinfo).isoformat(timespec="seconds")
@@ -201,7 +190,6 @@ def _find_comparison_snapshot(
     if row:
         return row
 
-    # 2) 退化：拿最早的快照（且要早于 latest_ts）
     return conn.execute(
         """
         SELECT * FROM trending_snapshots
@@ -241,7 +229,6 @@ def token_detail(
         previous = _find_comparison_snapshot(conn, chain, address, latest["ts"]) if latest else None
 
     if latest is None:
-        # 本地没有这个代币，调 cli 兜底
         try:
             info = gmgn_client.token_info(chain, address)
         except gmgn_client.GMGNCliError as e:
@@ -300,7 +287,6 @@ def token_detail(
             "previous_ts": previous["ts"] if previous else None,
         }
 
-        # 算 holder_growth + 时间窗口
         holder_growth_pct = None
         window_hours = None
         if previous:
@@ -336,7 +322,6 @@ def token_detail(
         **base,
         "holder_growth_pct": score_input.get("holder_growth_pct"),
         "comparison_window_hours": score_input.get("window_hours"),
-        # 兼容老字段：iOS Models 里有 volume_ratio，给 null 不会崩
         "volume_ratio": None,
         "accumulation_score": score,
     }
@@ -344,12 +329,7 @@ def token_detail(
 
 # ---------- K 线 ----------
 _RESOLUTION_HOURS: dict[str, int] = {
-    "1m": 6,
-    "5m": 24,
-    "15m": 72,
-    "1h": 168,
-    "4h": 720,
-    "1d": 2160,
+    "1m": 6, "5m": 24, "15m": 72, "1h": 168, "4h": 720, "1d": 2160,
 }
 
 
@@ -419,6 +399,71 @@ def holdings_aggregate(
         addresses=req.addresses,
         min_holders=req.min_holders,
     )
+
+
+# ---------- 雷达信号（阶段 E 新增）----------
+@app.get("/api/v1/radar/signals")
+def radar_signals(
+    hours: int = Query(24, ge=1, le=168, description="回溯多少小时的信号"),
+    chain: str | None = Query(None, description="可选：只返回某条链的信号"),
+    limit: int = Query(100, ge=1, le=500),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    """
+    返回最近触发的雷达信号，按时间倒序。
+    """
+    require_auth(authorization)
+
+    cutoff = datetime.utcnow().isoformat(timespec="seconds") + "+00:00"
+    # 上一行只是占位，下面用 SQL 算 cutoff
+    sql = """
+        SELECT id, chain, address, triggered_at,
+               trigger_window, trigger_pct,
+               price_usd, market_cap, liquidity_usd, volume_usd,
+               smart_degen_count, holder_count, top10_holder_rate, is_honeypot,
+               symbol, name, logo_url
+          FROM radar_signals
+         WHERE triggered_at >= datetime('now', ?)
+    """
+    params: list[Any] = [f'-{hours} hours']
+    if chain:
+        sql += " AND chain = ?"
+        params.append(chain)
+    sql += " ORDER BY triggered_at DESC LIMIT ?"
+    params.append(limit)
+
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    signals = [
+        {
+            "id": r["id"],
+            "chain": r["chain"],
+            "address": r["address"],
+            "triggered_at": r["triggered_at"],
+            "trigger_window": r["trigger_window"],
+            "trigger_pct": r["trigger_pct"],
+            "price_usd": r["price_usd"],
+            "market_cap": r["market_cap"],
+            "liquidity_usd": r["liquidity_usd"],
+            "volume_usd": r["volume_usd"],
+            "smart_degen_count": r["smart_degen_count"],
+            "holder_count": r["holder_count"],
+            "top10_holder_rate": r["top10_holder_rate"],
+            "is_honeypot": bool(r["is_honeypot"]) if r["is_honeypot"] is not None else None,
+            "symbol": r["symbol"],
+            "name": r["name"],
+            "logo_url": r["logo_url"],
+        }
+        for r in rows
+    ]
+
+    return {
+        "hours": hours,
+        "chain": chain,
+        "count": len(signals),
+        "signals": signals,
+    }
 
 
 # ---------- 手动刷新 ----------

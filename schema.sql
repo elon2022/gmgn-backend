@@ -47,3 +47,37 @@ CREATE INDEX IF NOT EXISTS idx_trending_latest
 
 CREATE INDEX IF NOT EXISTS idx_trending_address
     ON trending_snapshots (chain, address, ts DESC);
+
+
+-- 雷达信号表（阶段 E 新增）
+CREATE TABLE IF NOT EXISTS radar_signals (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain                TEXT NOT NULL,
+    address              TEXT NOT NULL,
+    triggered_at         TEXT NOT NULL,        -- ISO 时间，触发时刻
+    -- 触发原因
+    trigger_window       TEXT NOT NULL,        -- '5m' / '15m'
+    trigger_pct          REAL NOT NULL,        -- 涨幅，比如 73.5
+    -- 触发时刻的快照
+    price_usd            REAL,
+    market_cap           REAL,
+    liquidity_usd        REAL,
+    volume_usd           REAL,
+    -- 触发时刻的智能信号（让 iOS 不用再查详情就能看个大概）
+    smart_degen_count    INTEGER,
+    holder_count         INTEGER,
+    top10_holder_rate    REAL,
+    is_honeypot          INTEGER,
+    -- 代币基本信息（冗余存一份，避免 join）
+    symbol               TEXT,
+    name                 TEXT,
+    logo_url             TEXT
+);
+
+-- 同一代币在 cooldown 时间内不重复触发，需要按 (chain, address) 倒序查最新
+CREATE INDEX IF NOT EXISTS idx_radar_token_recent
+    ON radar_signals (chain, address, triggered_at DESC);
+
+-- iOS 拉取信号列表按时间倒序
+CREATE INDEX IF NOT EXISTS idx_radar_recent
+    ON radar_signals (triggered_at DESC);
