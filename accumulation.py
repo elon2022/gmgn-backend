@@ -5,17 +5,10 @@
         + 维度3 (筹码结构 25) + 维度4 (流动性 15)
         - 风险扣分
 
-返回结构：
-    {
-        "total": int 0-100,
-        "components": {
-            "smart_money": {"score": ..., "reason": "..."},
-            "stealth_accumulation": {...},
-            "holder_concentration": {...},
-            "liquidity": {...},
-        },
-        "penalties": [{"score": -X, "reason": "..."}, ...],
-    }
+关键改动（v0.4）：
+- 温和吸筹改成只看 holder_growth_pct，按时间窗口自适应阈值
+- 去掉 volume_ratio（GMGN volume 字段语义不明确，5min 采样下噪声太大）
+- 新增 comparison_window_hours 入参：让公式知道是基于多长时间的数据
 """
 from typing import Any
 
@@ -39,48 +32,75 @@ def _smart_money(smart_degen_count: int | None) -> dict:
 
 def _stealth_accumulation(
     holder_growth_pct: float | None,
-    volume_ratio: float | None,
+    window_hours: float | None,
 ) -> dict:
     """
     温和吸筹模式 (0-30)。
-    特征：持币人数在涨，但成交量没爆 → 庄家在静静收筹码。
 
-    holder_growth_pct: 持币人数变化百分比（正数表示涨）
-    volume_ratio:      当前 volume / 前一周期 volume（1.0 = 持平）
+    阈值随时间窗口自适应：
+    - 窗口 < 1h        → 数据不足，0 分（不算扣分，等数据攒够）
+    - 1h <= 窗口 < 4h  → > 0.5% 满分；> 0.2% 半分；> 0  少量；其他 0
+    - 4h <= 窗口 < 24h → > 2%   满分；> 0.8% 半分；> 0  少量；其他 0
+    - 窗口 >= 24h      → > 5%   满分；> 2%   半分；> 0  少量；其他 0
+
+    成交量维度被移除（5 分钟采样下 GMGN 的 volume 字段噪声过大，
+    且字段含义模糊，比例不可靠）。
     """
-    if holder_growth_pct is None or volume_ratio is None:
+    if holder_growth_pct is None or window_hours is None:
         return {
             "score": 0,
             "max": 30,
-            "reason": "数据不足（需要至少 2 次快照对比）",
+            "reason": "数据收集中（需要至少 1 小时历史）",
+        }
+
+    if window_hours < 1.0:
+        return {
+            "score": 0,
+            "max": 30,
+            "reason": f"数据收集中（已收集 {_format_hours(window_hours)}）",
         }
 
     g = holder_growth_pct
-    v = volume_ratio
 
-    if g > 5 and 0.7 <= v <= 1.3:
+    # 按窗口大小分档
+    if window_hours >= 24:
+        full_thresh, half_thresh = 5.0, 2.0
+        window_label = "24h"
+    elif window_hours >= 4:
+        full_thresh, half_thresh = 2.0, 0.8
+        window_label = f"{int(window_hours)}h"
+    else:
+        full_thresh, half_thresh = 0.5, 0.2
+        window_label = _format_hours(window_hours)
+
+    if g >= full_thresh:
         return {
-            "score": 30,
-            "max": 30,
-            "reason": f"持币人数 +{g:.1f}%，量价平稳（×{v:.2f}）✓",
+            "score": 30, "max": 30,
+            "reason": f"持币人数 {window_label} 内 +{g:.2f}% ✓ 强吸筹",
         }
-    if g > 2 and 0.5 <= v <= 1.5:
+    if g >= half_thresh:
         return {
-            "score": 15,
-            "max": 30,
-            "reason": f"持币人数 +{g:.1f}%，量价较稳（×{v:.2f}）",
+            "score": 15, "max": 30,
+            "reason": f"持币人数 {window_label} 内 +{g:.2f}%，温和吸筹",
         }
     if g > 0:
         return {
-            "score": 5,
-            "max": 30,
-            "reason": f"持币人数 +{g:.1f}%，但量价异常（×{v:.2f}）",
+            "score": 5, "max": 30,
+            "reason": f"持币人数 {window_label} 内 +{g:.2f}%，弱信号",
         }
     return {
-        "score": 0,
-        "max": 30,
-        "reason": f"持币人数 {g:.1f}%，无吸筹迹象",
+        "score": 0, "max": 30,
+        "reason": f"持币人数 {window_label} 内 {g:+.2f}%，无吸筹迹象",
     }
+
+
+def _format_hours(h: float) -> str:
+    """把小数小时格式化成易读字符串。"""
+    if h < 1:
+        return f"{int(h * 60)}min"
+    if h == int(h):
+        return f"{int(h)}h"
+    return f"{h:.1f}h"
 
 
 def _holder_concentration(top10_rate: float | None) -> dict:
@@ -141,7 +161,7 @@ def calculate(
     *,
     smart_degen_count: int | None,
     holder_growth_pct: float | None,
-    volume_ratio: float | None,
+    window_hours: float | None,
     top10_holder_rate: float | None,
     liquidity_usd: float | None,
     is_honeypot: bool | None,
@@ -151,7 +171,7 @@ def calculate(
 ) -> dict:
     components = {
         "smart_money": _smart_money(smart_degen_count),
-        "stealth_accumulation": _stealth_accumulation(holder_growth_pct, volume_ratio),
+        "stealth_accumulation": _stealth_accumulation(holder_growth_pct, window_hours),
         "holder_concentration": _holder_concentration(top10_holder_rate),
         "liquidity": _liquidity(liquidity_usd),
     }
@@ -168,4 +188,5 @@ def calculate(
         "total": _round(total),
         "components": components,
         "penalties": penalties,
+        "window_hours": window_hours,
     }
