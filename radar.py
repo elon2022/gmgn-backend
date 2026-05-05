@@ -1,9 +1,9 @@
 """
 信号雷达：扫描最新两次快照，找出"小市值短期暴涨"的代币入库。
 
-触发规则（预设 A：保守严苛）：
+触发规则（预设 A：保守严苛，匹配 10 分钟刷新频率）：
 - 市值 $200K - $1M
-- 5 分钟内 +50% 或 15 分钟内 +100%
+- 10 分钟内 +50% 或 30 分钟内 +100%
 - 流动性 ≥ $50K
 - 不是蜜罐
 - 同一代币 24h 内已触发过则跳过（cooldown）
@@ -19,8 +19,9 @@ CONFIG = {
     "market_cap_min":     200_000,
     "market_cap_max":   1_000_000,
     "liquidity_min":       50_000,
-    "trigger_5m_pct":          50.0,
-    "trigger_15m_pct":        100.0,
+    # 两档时间窗口 + 对应阈值
+    "trigger_10m_pct":         50.0,
+    "trigger_30m_pct":        100.0,
     "cooldown_hours":          24,
     "skip_honeypot":         True,
 }
@@ -61,11 +62,11 @@ def _find_past_snapshot(
     address: str,
     latest_ts: str,
     target_minutes_ago: int,
-    tolerance_minutes: int = 2,
+    tolerance_minutes: int = 4,
 ) -> sqlite3.Row | None:
     """
     找一个"约 N 分钟前"的快照（容差 ±tolerance）。
-    用于算 5min / 15min 涨幅。
+    10 分钟刷新频率下，容差设 ±4min 能稳定匹配上一次/上两次快照。
     """
     latest_dt = _parse_iso(latest_ts)
     if not latest_dt:
@@ -111,7 +112,7 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
     latest_ts = latest_ts_row[0]
     now = _parse_iso(latest_ts) or datetime.now(timezone.utc)
 
-    # 2. 拿这次快照里所有代币（已经按 rank 排序）
+    # 2. 拿这次快照里所有代币
     current_rows = conn.execute(
         """
         SELECT * FROM trending_snapshots
@@ -141,7 +142,7 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
         if _is_in_cooldown(conn, chain, curr["address"], now, CONFIG["cooldown_hours"]):
             continue
 
-        # 7. 涨幅检测：5min 和 15min 各检查一次
+        # 7. 涨幅检测：10min 和 30min 各检查一次
         curr_price = curr["price_usd"]
         if not curr_price or curr_price <= 0:
             continue
@@ -149,22 +150,22 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
         trigger_window = None
         trigger_pct = None
 
-        # 5 分钟窗口
-        prev_5m = _find_past_snapshot(conn, chain, curr["address"], latest_ts, 5)
-        if prev_5m and prev_5m["price_usd"] and prev_5m["price_usd"] > 0:
-            pct = (curr_price - prev_5m["price_usd"]) / prev_5m["price_usd"] * 100
-            if pct >= CONFIG["trigger_5m_pct"]:
-                trigger_window = "5m"
+        # 10 分钟窗口（实际找 10±4 分钟前的快照）
+        prev_10m = _find_past_snapshot(conn, chain, curr["address"], latest_ts, 10)
+        if prev_10m and prev_10m["price_usd"] and prev_10m["price_usd"] > 0:
+            pct = (curr_price - prev_10m["price_usd"]) / prev_10m["price_usd"] * 100
+            if pct >= CONFIG["trigger_10m_pct"]:
+                trigger_window = "10m"
                 trigger_pct = pct
 
-        # 15 分钟窗口（如果 5m 没触发或者 15m 涨幅更大）
-        prev_15m = _find_past_snapshot(conn, chain, curr["address"], latest_ts, 15)
-        if prev_15m and prev_15m["price_usd"] and prev_15m["price_usd"] > 0:
-            pct_15m = (curr_price - prev_15m["price_usd"]) / prev_15m["price_usd"] * 100
-            if pct_15m >= CONFIG["trigger_15m_pct"]:
-                if trigger_window is None or pct_15m > (trigger_pct or 0):
-                    trigger_window = "15m"
-                    trigger_pct = pct_15m
+        # 30 分钟窗口（如果 10m 没触发或者 30m 涨幅更显著）
+        prev_30m = _find_past_snapshot(conn, chain, curr["address"], latest_ts, 30)
+        if prev_30m and prev_30m["price_usd"] and prev_30m["price_usd"] > 0:
+            pct_30m = (curr_price - prev_30m["price_usd"]) / prev_30m["price_usd"] * 100
+            if pct_30m >= CONFIG["trigger_30m_pct"]:
+                if trigger_window is None or pct_30m > (trigger_pct or 0):
+                    trigger_window = "30m"
+                    trigger_pct = pct_30m
 
         if trigger_window is None:
             continue
