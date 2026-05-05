@@ -6,11 +6,15 @@ import os
 import subprocess
 from typing import Any
 
+# GMGN_CLI = os.environ.get(
+#     "GMGN_CLI",
+#     "/Users/liuyangyang/.local/share/fnm/node-versions/v24.14.0/installation/bin/gmgn-cli",
+# )
+
 GMGN_CLI = os.environ.get(
     "GMGN_CLI",
-    "/Users/liuyangyang/.local/share/fnm/node-versions/v24.14.0/installation/bin/gmgn-cli",
+    "gmgn-cli",
 )
-
 
 class GMGNCliError(Exception):
     """gmgn-cli 调用或返回内容异常。"""
