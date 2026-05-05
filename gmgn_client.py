@@ -18,6 +18,14 @@ class GMGNCliError(Exception):
 
 
 def _run(args: list[str]) -> dict[str, Any] | list:
+    """
+    跑 gmgn-cli 子命令，返回解析后的 data 部分。
+
+    cli 返回有两种风格：
+      A: {"code": 0, "data": {...}, "message": "success"}   ← trending / token info / wallet 用这种
+      B: {"list": [...]}                                     ← kline 直接裸返回，没有 code 包装
+    我们都要兼容。
+    """
     cmd = [GMGN_CLI, *args, "--raw"]
     try:
         result = subprocess.run(
@@ -33,6 +41,13 @@ def _run(args: list[str]) -> dict[str, Any] | list:
     except json.JSONDecodeError as e:
         raise GMGNCliError(f"gmgn-cli bad JSON: {result.stdout[:200]}") from e
 
+    # 兼容裸返回：没有 code 字段且不是字典 / 字典里没 code，直接当成数据返回
+    if not isinstance(payload, dict):
+        return payload
+    if "code" not in payload:
+        return payload   # 例如 kline 的 {"list":[...]}
+
+    # 标准包装：检查 code
     if payload.get("code") != 0:
         raise GMGNCliError(f"gmgn-cli error: {payload.get('message')}")
 
@@ -60,8 +75,8 @@ def token_kline(
     """
     K 线。
     cli 用 --from / --to 时间戳范围（秒），不支持 --limit。
-    返回每条形如：
-        {time(毫秒), open, high, low, close, volume(都是字符串)}
+    返回：直接是 {"list":[{time(毫秒), open, high, low, close, volume(都是字符串)}, ...]}
+    没有 code 字段包装。
     """
     now = int(time.time())
     from_ts = now - hours * 3600
