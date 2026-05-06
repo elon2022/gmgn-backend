@@ -127,20 +127,42 @@ def aggregate(
 
 def _extract_token(holding: dict) -> dict | None:
     """
-    不同 cli 版本返回的持仓项结构不一致。
-    可能是 {token: {...}, balance, usd_value} 也可能是平铺的。
-    这里做最小兼容。
+    不同 cli 版本返回的持仓项结构不一致。归一化为统一字段：
+        {chain, address, symbol, name, logo}
+
+    cli v1.2.x (portfolio holdings) 实际结构：
+        {
+          "balance": "...", "usd_value": "...",
+          "token": {
+            "token_address": "0x...",   ← 注意叫 token_address，不是 address
+            "symbol": "...", "name": "...", "logo": "...",
+            ...
+          }
+        }
+    历史上也兼容平铺结构 {address, token_address, symbol, ...}。
     """
+    # 优先看嵌套 token
     if "token" in holding and isinstance(holding["token"], dict):
-        return holding["token"]
-    # 平铺结构
-    if "address" in holding or "token_address" in holding:
+        t = holding["token"]
+        addr = t.get("token_address") or t.get("address") or t.get("contract_address")
+        if not addr:
+            return None
         return {
-            "chain": holding.get("chain"),
-            "address": holding.get("token_address") or holding.get("address"),
-            "symbol": holding.get("symbol") or holding.get("token_symbol"),
-            "name": holding.get("name") or holding.get("token_name"),
-            "logo": holding.get("logo") or holding.get("logo_url"),
+            "chain":   t.get("chain") or holding.get("chain"),
+            "address": addr,
+            "symbol":  t.get("symbol") or t.get("token_symbol"),
+            "name":    t.get("name")   or t.get("token_name"),
+            "logo":    t.get("logo")   or t.get("logo_url"),
+        }
+    # 平铺结构兼容
+    addr = holding.get("token_address") or holding.get("address") or holding.get("contract_address")
+    if addr:
+        return {
+            "chain":   holding.get("chain"),
+            "address": addr,
+            "symbol":  holding.get("symbol") or holding.get("token_symbol"),
+            "name":    holding.get("name")   or holding.get("token_name"),
+            "logo":    holding.get("logo")   or holding.get("logo_url"),
         }
     return None
 
