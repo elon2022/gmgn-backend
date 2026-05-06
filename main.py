@@ -421,7 +421,7 @@ def radar_signals(
                trigger_window, trigger_pct,
                price_usd, market_cap, liquidity_usd, volume_usd,
                smart_degen_count, holder_count, top10_holder_rate, is_honeypot,
-               symbol, name, logo_url
+               symbol, name, logo_url, peak_market_cap
           FROM radar_signals
          WHERE triggered_at >= datetime('now', ?)
     """
@@ -454,6 +454,7 @@ def radar_signals(
             "symbol": r["symbol"],
             "name": r["name"],
             "logo_url": r["logo_url"],
+            "peak_market_cap": r["peak_market_cap"],
         }
         for r in rows
     ]

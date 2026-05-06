@@ -29,7 +29,23 @@ def init_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
+    _migrate_old_db(conn)
     return conn
+
+
+def _migrate_old_db(conn: sqlite3.Connection) -> None:
+    """
+    兼容老库：用 PRAGMA 检测列是否存在，不存在则 ALTER 加上。
+    SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，重复执行会报错，所以要显式检测。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(radar_signals)").fetchall()}
+    if "peak_market_cap" not in cols:
+        try:
+            conn.execute("ALTER TABLE radar_signals ADD COLUMN peak_market_cap REAL")
+            conn.commit()
+            print("[migrate] radar_signals: added column peak_market_cap")
+        except sqlite3.OperationalError as e:
+            print(f"[migrate] failed to add peak_market_cap: {e}")
 
 
 def upsert_token(conn: sqlite3.Connection, item: dict, ts: str) -> None:
@@ -154,15 +170,29 @@ def refresh_all(
 
         # 所有链刷完之后跑雷达扫描（只扫成功刷新的链）
         if success_chains:
+            # 暴涨型
             scan_results = radar.scan_all_chains(conn, success_chains)
             total_signals = sum(len(v) for v in scan_results.values())
             if total_signals > 0:
-                print(f"---- radar: {total_signals} new signals ----")
+                print(f"---- radar [breakout]: {total_signals} new signals ----")
                 for chain, signals in scan_results.items():
                     for sig in signals:
                         print(f"  [{chain}] {sig.get('symbol') or sig['address'][:10]}: {sig['trigger']}, MC=${sig['market_cap']:,.0f}")
             else:
-                print("---- radar: no new signals ----")
+                print("---- radar [breakout]: no new signals ----")
+
+            # 回溯型
+            rebound_results = radar.scan_rebounds_all_chains(conn, success_chains)
+            total_rebounds = sum(len(v) for v in rebound_results.values())
+            if total_rebounds > 0:
+                print(f"---- radar [rebound]: {total_rebounds} new signals ----")
+                for chain, signals in rebound_results.items():
+                    for sig in signals:
+                        peak = sig.get("peak", 0)
+                        print(f"  [{chain}] {sig.get('symbol') or sig['address'][:10]}: {sig['trigger']}, "
+                              f"peak=${peak:,.0f} → now=${sig['market_cap']:,.0f}")
+            else:
+                print("---- radar [rebound]: no new signals ----")
     finally:
         conn.close()
     return results
@@ -173,8 +203,9 @@ def refresh(chain: str = "eth", interval: str = "5m", limit: int = 50) -> int:
     conn = init_db()
     try:
         n = refresh_chain(conn, chain, interval, limit)
-        # 单链刷新也跑一次雷达
+        # 单链刷新也跑一次雷达（暴涨 + 回溯）
         radar.scan_and_save(conn, chain)
+        radar.scan_rebounds(conn, chain)
         return n
     finally:
         conn.close()

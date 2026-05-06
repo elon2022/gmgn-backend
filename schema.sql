@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS radar_signals (
     address              TEXT NOT NULL,
     triggered_at         TEXT NOT NULL,        -- ISO 时间，触发时刻
     -- 触发原因
-    trigger_window       TEXT NOT NULL,        -- '5m' / '15m'
-    trigger_pct          REAL NOT NULL,        -- 涨幅，比如 73.5
+    trigger_window       TEXT NOT NULL,        -- '10m' / '30m' (暴涨) / 'rebound_major' / 'rebound_minor' (回溯)
+    trigger_pct          REAL NOT NULL,        -- 暴涨：正数涨幅；回溯：负数回撤（如 -65 表示从高点跌了 65%）
     -- 触发时刻的快照
     price_usd            REAL,
     market_cap           REAL,
@@ -71,7 +71,10 @@ CREATE TABLE IF NOT EXISTS radar_signals (
     -- 代币基本信息（冗余存一份，避免 join）
     symbol               TEXT,
     name                 TEXT,
-    logo_url             TEXT
+    logo_url             TEXT,
+    -- 回溯型信号专用：触发时该币的历史最高市值（30 天内）
+    -- 暴涨型信号此字段为 NULL
+    peak_market_cap      REAL
 );
 
 -- 同一代币在 cooldown 时间内不重复触发，需要按 (chain, address) 倒序查最新

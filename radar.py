@@ -1,12 +1,30 @@
 """
-信号雷达：扫描最新两次快照，找出"小市值短期暴涨"的代币入库。
+信号雷达：扫描最新快照，找出值得关注的代币入库。
 
-触发规则（预设 A：保守严苛，匹配 10 分钟刷新频率）：
-- 市值 $200K - $1M
-- 10 分钟内 +50% 或 30 分钟内 +100%
-- 流动性 ≥ $50K
-- 不是蜜罐
-- 同一代币 24h 内已触发过则跳过（cooldown）
+两类信号：
+
+1. 暴涨型（scan_and_save）：小市值短期暴涨
+   - 市值 $200K - $1M
+   - 10 分钟内 +50% 或 30 分钟内 +100%
+   - 流动性 ≥ $50K
+   - 不是蜜罐
+   - 24h cooldown
+   - trigger_window 写 "10m" / "30m"
+   - trigger_pct 是涨幅正数
+
+2. 回溯型（scan_rebounds）：高位币跌回小市值机会区
+   双轨：
+   - "rebound_major"（大饱饱）：历史高点 ≥ $5M
+   - "rebound_minor"（潜伏）：历史高点 $1M-$5M
+   共同条件：
+   - 当前市值 $250K-$1M
+   - 当前市值 ≤ 历史高点 50%
+   - 流动性 ≥ $20K
+   - 不是蜜罐
+   - 跨越触发：上次扫描时该币市值 > 阈值，本次 ≤ 阈值（防徘徊刷屏）
+   - 72h cooldown（兜底，防跨越逻辑万一失效）
+   - trigger_pct 存"距高点的回撤百分比"，负数（如 -65 表示跌了 65%）
+   - peak_market_cap 字段存历史高点（iOS 显示「高点 $X → 现 $Y」用）
 
 由 refresh.py 在每次刷新所有链之后调用一次。
 """
@@ -14,7 +32,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-# 配置（将来想做用户可调，先写死在这）
+# 暴涨型配置
 CONFIG = {
     "market_cap_min":     200_000,
     "market_cap_max":   1_000_000,
@@ -24,6 +42,23 @@ CONFIG = {
     "trigger_30m_pct":        100.0,
     "cooldown_hours":          24,
     "skip_honeypot":         True,
+}
+
+# 回溯型配置
+REBOUND_CONFIG = {
+    # 历史高点查询窗口
+    "peak_lookback_days":          30,
+    # 双轨高点门槛
+    "peak_major_min":       5_000_000,   # ≥ $5M  → "rebound_major"（大饱饱）
+    "peak_minor_min":       1_000_000,   # $1M-$5M → "rebound_minor"（潜伏）
+    # 当前市值范围
+    "current_mc_min":         250_000,
+    "current_mc_max":       1_000_000,
+    # 当前市值必须 ≤ 历史高点的多少
+    "drop_threshold":            0.50,    # 50%
+    "liquidity_min":           20_000,
+    "cooldown_hours":              72,
+    "skip_honeypot":            True,
 }
 
 
@@ -178,8 +213,8 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
                 trigger_window, trigger_pct,
                 price_usd, market_cap, liquidity_usd, volume_usd,
                 smart_degen_count, holder_count, top10_holder_rate, is_honeypot,
-                symbol, name, logo_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                symbol, name, logo_url, peak_market_cap
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 chain, curr["address"], latest_ts,
@@ -203,12 +238,205 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
 
 
 def scan_all_chains(conn: sqlite3.Connection, chains: list[str]) -> dict[str, list[dict]]:
-    """对多条链各扫一次。"""
+    """对多条链各扫一次（暴涨型）。"""
     results = {}
     for chain in chains:
         try:
             results[chain] = scan_and_save(conn, chain)
         except Exception as e:
             print(f"[radar] {chain} scan failed: {e}")
+            results[chain] = []
+    return results
+
+
+# ============================================================
+# 回溯型扫描（rebound）：高位币跌回小市值机会区
+# ============================================================
+
+def _get_peak_market_cap(
+    conn: sqlite3.Connection,
+    chain: str,
+    address: str,
+    lookback_days: int,
+) -> float | None:
+    """
+    在 lookback_days 内，从 trending_snapshots 找该币的历史最高市值。
+    没数据返回 None。
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat(timespec="seconds")
+    row = conn.execute(
+        """
+        SELECT MAX(market_cap) AS peak
+          FROM trending_snapshots
+         WHERE chain = ? AND address = ? AND ts >= ?
+           AND market_cap IS NOT NULL
+        """,
+        (chain, address, cutoff),
+    ).fetchone()
+    if not row or row["peak"] is None:
+        return None
+    return float(row["peak"])
+
+
+def _get_previous_market_cap(
+    conn: sqlite3.Connection,
+    chain: str,
+    address: str,
+    latest_ts: str,
+) -> float | None:
+    """
+    取该币上一次（latest_ts 之前最近的一次）扫描时的市值。
+    用于跨越触发判断。没有上次快照返回 None。
+    """
+    row = conn.execute(
+        """
+        SELECT market_cap
+          FROM trending_snapshots
+         WHERE chain = ? AND address = ? AND ts < ?
+         ORDER BY ts DESC
+         LIMIT 1
+        """,
+        (chain, address, latest_ts),
+    ).fetchone()
+    if not row or row["market_cap"] is None:
+        return None
+    return float(row["market_cap"])
+
+
+def _is_rebound_in_cooldown(
+    conn: sqlite3.Connection,
+    chain: str,
+    address: str,
+    now: datetime,
+    cooldown_hours: int,
+) -> bool:
+    """检查该币是否在 cooldown 内已经触发过任何 rebound 类信号。"""
+    cutoff = (now - timedelta(hours=cooldown_hours)).isoformat(timespec="seconds")
+    row = conn.execute(
+        """
+        SELECT 1 FROM radar_signals
+         WHERE chain = ? AND address = ?
+           AND trigger_window IN ('rebound_major', 'rebound_minor')
+           AND triggered_at >= ?
+         LIMIT 1
+        """,
+        (chain, address, cutoff),
+    ).fetchone()
+    return row is not None
+
+
+def scan_rebounds(conn: sqlite3.Connection, chain: str) -> list[dict]:
+    """
+    扫描某条链最新快照，找出"高位回调到机会区"的代币写入 radar_signals。
+    返回触发的信号列表。
+    """
+    cfg = REBOUND_CONFIG
+
+    # 1. 拿这条链最新的一次快照时间
+    latest_ts_row = conn.execute(
+        "SELECT MAX(ts) FROM trending_snapshots WHERE chain = ?", (chain,)
+    ).fetchone()
+    if not latest_ts_row or not latest_ts_row[0]:
+        return []
+    latest_ts = latest_ts_row[0]
+    now = _parse_iso(latest_ts) or datetime.now(timezone.utc)
+
+    # 2. 拿这次快照里所有代币
+    current_rows = conn.execute(
+        "SELECT * FROM trending_snapshots WHERE chain = ? AND ts = ?",
+        (chain, latest_ts),
+    ).fetchall()
+
+    triggered = []
+    for curr in current_rows:
+        addr = curr["address"]
+        mc = curr["market_cap"]
+
+        # 3. 当前市值范围过滤
+        if mc is None or not (cfg["current_mc_min"] <= mc <= cfg["current_mc_max"]):
+            continue
+
+        # 4. 流动性
+        liq = curr["liquidity_usd"] or 0
+        if liq < cfg["liquidity_min"]:
+            continue
+
+        # 5. 蜜罐
+        symbol, name, logo, is_honeypot = _get_token_meta(conn, chain, addr)
+        if cfg["skip_honeypot"] and is_honeypot:
+            continue
+
+        # 6. 拿历史高点（30 天内）
+        peak = _get_peak_market_cap(conn, chain, addr, cfg["peak_lookback_days"])
+        if peak is None or peak < cfg["peak_minor_min"]:
+            continue  # 没历史数据，或最高也才几十万——不够格
+
+        # 7. 当前市值必须 ≤ 高点的 50%
+        threshold = peak * cfg["drop_threshold"]
+        if mc > threshold:
+            continue
+
+        # 8. 跨越触发：上次扫描时市值必须 > 阈值（即"刚跌破"）
+        prev_mc = _get_previous_market_cap(conn, chain, addr, latest_ts)
+        if prev_mc is None:
+            # 没历史快照（这是该币第一次进 trending），保守起见跳过
+            continue
+        if prev_mc <= threshold:
+            continue  # 上次就已经在阈值下方了，不是"刚跌破"
+
+        # 9. cooldown 兜底
+        if _is_rebound_in_cooldown(conn, chain, addr, now, cfg["cooldown_hours"]):
+            continue
+
+        # 10. 分轨：major (≥$5M) vs minor ($1M-$5M)
+        if peak >= cfg["peak_major_min"]:
+            window = "rebound_major"
+        else:
+            window = "rebound_minor"
+
+        # 11. 计算回撤百分比（负数）
+        drawdown_pct = (mc - peak) / peak * 100  # 比如 mc=400K, peak=1M → -60.0
+
+        # 12. 写入
+        conn.execute(
+            """
+            INSERT INTO radar_signals (
+                chain, address, triggered_at,
+                trigger_window, trigger_pct,
+                price_usd, market_cap, liquidity_usd, volume_usd,
+                smart_degen_count, holder_count, top10_holder_rate, is_honeypot,
+                symbol, name, logo_url, peak_market_cap
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chain, addr, latest_ts,
+                window, round(drawdown_pct, 2),
+                curr["price_usd"], mc, liq, curr["volume_usd"],
+                curr["smart_degen_count"], curr["holder_count"], curr["top10_holder_rate"],
+                1 if is_honeypot else 0 if is_honeypot is not None else None,
+                symbol, name, logo, peak,
+            ),
+        )
+        triggered.append({
+            "chain": chain,
+            "address": addr,
+            "symbol": symbol,
+            "trigger": f"{window} {drawdown_pct:.1f}%",
+            "market_cap": mc,
+            "peak": peak,
+        })
+
+    conn.commit()
+    return triggered
+
+
+def scan_rebounds_all_chains(conn: sqlite3.Connection, chains: list[str]) -> dict[str, list[dict]]:
+    """对多条链各扫一次（回溯型）。"""
+    results = {}
+    for chain in chains:
+        try:
+            results[chain] = scan_rebounds(conn, chain)
+        except Exception as e:
+            print(f"[radar:rebound] {chain} scan failed: {e}")
             results[chain] = []
     return results
