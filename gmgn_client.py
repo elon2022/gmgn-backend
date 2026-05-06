@@ -96,8 +96,17 @@ def token_kline(
 def wallet_holdings(chain: str, address: str) -> list[dict]:
     """
     单个钱包的代币持仓列表。
+
+    cli 命令是 `gmgn-cli portfolio holdings`（不是 wallet）。
+    参数名是 `--wallet`（不是 --address）。
+    limit 默认 20，最大 50，我们直接拉满。
     """
-    data = _run(["wallet", "holdings", "--chain", chain, "--address", address])
+    data = _run([
+        "portfolio", "holdings",
+        "--chain", chain,
+        "--wallet", address,
+        "--limit", "50",
+    ])
     if isinstance(data, list):
         return data
     return data.get("holdings") or data.get("list") or []
