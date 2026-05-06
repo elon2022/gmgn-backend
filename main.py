@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 import accumulation
 import gmgn_client
 import holdings as holdings_agg
+import refresh as refresh_mod
 
 API_TOKEN = os.environ.get("API_TOKEN", "dev-token-change-me")
 
@@ -30,6 +31,22 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+# ---------- 启动时跑数据库迁移 ----------
+# refresh.py 里的 init_db() 包含 schema 创建 + ALTER TABLE 兼容老库的迁移。
+# 历史上这个迁移只在 refresh 任务跑起来时才会执行——但 HTTP API 走的是 main.py 自己的
+# db() 函数，会在 refresh 任务还没到点时就处理请求，导致新字段查不到 → 500。
+# 在 startup 阶段跑一次 init_db() 让迁移在服务接受请求之前就完成。
+@app.on_event("startup")
+def _on_startup() -> None:
+    try:
+        conn = refresh_mod.init_db()
+        conn.close()
+        print("[startup] db init/migrate ok")
+    except Exception as e:
+        # 不让启动失败——已经存在的列重复 ALTER 会报错，但函数里有 try/except 保护
+        print(f"[startup] db init/migrate failed: {e}")
 
 
 # ---------- 工具 ----------
