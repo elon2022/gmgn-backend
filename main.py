@@ -34,10 +34,6 @@ app.add_middleware(
 
 
 # ---------- 启动时跑数据库迁移 ----------
-# refresh.py 里的 init_db() 包含 schema 创建 + ALTER TABLE 兼容老库的迁移。
-# 历史上这个迁移只在 refresh 任务跑起来时才会执行——但 HTTP API 走的是 main.py 自己的
-# db() 函数，会在 refresh 任务还没到点时就处理请求，导致新字段查不到 → 500。
-# 在 startup 阶段跑一次 init_db() 让迁移在服务接受请求之前就完成。
 @app.on_event("startup")
 def _on_startup() -> None:
     try:
@@ -45,7 +41,6 @@ def _on_startup() -> None:
         conn.close()
         print("[startup] db init/migrate ok")
     except Exception as e:
-        # 不让启动失败——已经存在的列重复 ALTER 会报错，但函数里有 try/except 保护
         print(f"[startup] db init/migrate failed: {e}")
 
 
@@ -58,6 +53,20 @@ def db():
         yield conn
     finally:
         conn.close()
+
+
+def _to_num(v: Any) -> float | None:
+    """
+    上游 cli 经常把数字以字符串形式返回（如 "923793.21"）。
+    iOS 期望 Double，下游 accumulation.calculate 也会做大小比较——
+    必须统一转成 float（或 None）。
+    """
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def require_auth(authorization: str | None) -> None:
@@ -226,6 +235,51 @@ def token_detail(
 ) -> dict[str, Any]:
     require_auth(authorization)
 
+    try:
+        return _build_token_detail(chain, address)
+    except HTTPException:
+        raise  # 401/404 直接透传
+    except Exception as e:
+        # 防御兜底：详情页对错误最敏感（iOS 直接白屏 500）。
+        # 把真实错误打到 stderr 让我们能在 journalctl 里看到，但仍返回 200，
+        # 让 iOS 至少展示链 + 地址 + 错误说明，不至于完全白板。
+        import traceback
+        print(f"[token_detail] {chain}/{address} failed:", flush=True)
+        traceback.print_exc()
+        return {
+            "chain": chain,
+            "address": address,
+            "symbol": None,
+            "name": None,
+            "logo_url": None,
+            "price_usd": None,
+            "price_change_pct": None,
+            "price_change_1h": None,
+            "volume_usd": None,
+            "liquidity_usd": None,
+            "market_cap": None,
+            "holder_count": None,
+            "smart_degen_count": None,
+            "top10_holder_rate": None,
+            "is_honeypot": None,
+            "is_renounced": None,
+            "buy_tax": None,
+            "sell_tax": None,
+            "twitter_url": None,
+            "website_url": None,
+            "telegram_url": None,
+            "snapshot_ts": None,
+            "previous_ts": None,
+            "holder_growth_pct": None,
+            "comparison_window_hours": None,
+            "volume_ratio": None,
+            "accumulation_score": None,
+            "_error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _build_token_detail(chain: str, address: str) -> dict[str, Any]:
+    """token_detail 主体逻辑——抽出来方便上层做 try/except 兜底。"""
     with db() as conn:
         latest = conn.execute(
             """
@@ -251,25 +305,33 @@ def token_detail(
         except gmgn_client.GMGNCliError as e:
             raise HTTPException(status_code=404, detail=f"token not found: {e}")
 
+        # 关键：上游 cli 在 sol/bsc/base 上常把数字以字符串返回，必须统一转 float
+        # 同时 sol cli 不返回 market_cap 字段，要从 price * total_supply 算出来
+        price = _to_num(info.get("price"))
+        total_supply = _to_num(info.get("total_supply")) or _to_num(info.get("circulating_supply"))
+        market_cap = _to_num(info.get("market_cap"))
+        if market_cap is None and price is not None and total_supply is not None:
+            market_cap = price * total_supply
+
         base = {
             "chain": chain,
             "address": address,
             "symbol": info.get("symbol"),
             "name": info.get("name"),
             "logo_url": info.get("logo"),
-            "price_usd": info.get("price"),
+            "price_usd": price,
             "price_change_pct": _normalize_pct(info.get("price_change_percent5m")),
             "price_change_1h": _normalize_pct(info.get("price_change_percent1h")),
-            "volume_usd": info.get("volume"),
-            "liquidity_usd": info.get("liquidity"),
-            "market_cap": info.get("market_cap"),
+            "volume_usd": _to_num(info.get("volume")),
+            "liquidity_usd": _to_num(info.get("liquidity")),
+            "market_cap": market_cap,
             "holder_count": info.get("holder_count"),
             "smart_degen_count": info.get("smart_degen_count"),
-            "top10_holder_rate": info.get("top_10_holder_rate"),
+            "top10_holder_rate": _to_num(info.get("top_10_holder_rate")),
             "is_honeypot": info.get("is_honeypot"),
             "is_renounced": info.get("is_renounced"),
-            "buy_tax": info.get("buy_tax"),
-            "sell_tax": info.get("sell_tax"),
+            "buy_tax": _to_num(info.get("buy_tax")),
+            "sell_tax": _to_num(info.get("sell_tax")),
             "twitter_url": info.get("twitter_username"),
             "website_url": info.get("website"),
             "telegram_url": info.get("telegram"),
@@ -284,19 +346,19 @@ def token_detail(
             "symbol": latest["symbol"],
             "name": latest["name"],
             "logo_url": latest["logo_url"],
-            "price_usd": latest["price_usd"],
-            "price_change_pct": latest["price_change_5m"],
-            "price_change_1h": latest["price_change_1h"],
-            "volume_usd": latest["volume_usd"],
-            "liquidity_usd": latest["liquidity_usd"],
-            "market_cap": latest["market_cap"],
+            "price_usd": _to_num(latest["price_usd"]),
+            "price_change_pct": _to_num(latest["price_change_5m"]),
+            "price_change_1h": _to_num(latest["price_change_1h"]),
+            "volume_usd": _to_num(latest["volume_usd"]),
+            "liquidity_usd": _to_num(latest["liquidity_usd"]),
+            "market_cap": _to_num(latest["market_cap"]),
             "holder_count": latest["holder_count"],
             "smart_degen_count": latest["smart_degen_count"],
-            "top10_holder_rate": latest["top10_holder_rate"],
+            "top10_holder_rate": _to_num(latest["top10_holder_rate"]),
             "is_honeypot": bool(latest["is_honeypot"]) if latest["is_honeypot"] is not None else None,
             "is_renounced": bool(latest["is_renounced"]) if latest["is_renounced"] is not None else None,
-            "buy_tax": latest["buy_tax"],
-            "sell_tax": latest["sell_tax"],
+            "buy_tax": _to_num(latest["buy_tax"]),
+            "sell_tax": _to_num(latest["sell_tax"]),
             "twitter_url": latest["twitter_url"],
             "website_url": latest["website_url"],
             "telegram_url": latest["telegram_url"],
@@ -438,7 +500,7 @@ def radar_signals(
                trigger_window, trigger_pct,
                price_usd, market_cap, liquidity_usd, volume_usd,
                smart_degen_count, holder_count, top10_holder_rate, is_honeypot,
-               symbol, name, logo_url, peak_market_cap
+               symbol, name, logo_url
           FROM radar_signals
          WHERE triggered_at >= datetime('now', ?)
     """
@@ -471,7 +533,6 @@ def radar_signals(
             "symbol": r["symbol"],
             "name": r["name"],
             "logo_url": r["logo_url"],
-            "peak_market_cap": r["peak_market_cap"],
         }
         for r in rows
     ]
