@@ -29,6 +29,10 @@ def init_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
+    # ---- 加载破灭法目（v2）schema ----
+    v2_schema_path = BASE_DIR / "schema_v2.sql"
+    if v2_schema_path.exists():
+        conn.executescript(v2_schema_path.read_text())
     _migrate_old_db(conn)
     return conn
 
@@ -193,6 +197,19 @@ def refresh_all(
                               f"peak=${peak:,.0f} → now=${sig['market_cap']:,.0f}")
             else:
                 print("---- radar [rebound]: no new signals ----")
+
+            # ===== 破灭法目（雷达 v2）=====   ← 这是新加的
+            try:
+                import radar_v2
+                v2_stats = radar_v2.scan_all_chains_v2(conn, success_chains)
+                total_v2 = sum(
+                    s.get("B", 0) + s.get("C", 0) + s.get("E1", 0) + s.get("E2", 0)
+                    for s in v2_stats.values() if isinstance(s, dict)
+                )
+                print(f"---- radar_v2 [破灭法目]: {total_v2} new signals ----")
+            except Exception as e:
+                print(f"[radar_v2] scan failed: {type(e).__name__}: {e}")
+
     finally:
         conn.close()
     return results

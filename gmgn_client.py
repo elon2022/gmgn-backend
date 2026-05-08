@@ -110,3 +110,40 @@ def wallet_holdings(chain: str, address: str) -> list[dict]:
     if isinstance(data, list):
         return data
     return data.get("holdings") or data.get("list") or []
+
+# ====== 在 gmgn_client.py 末尾追加（不要替换原有任何代码）======
+
+
+def trenches(
+    chain: str,
+    type_: str = "completed",
+    limit: int = 80,
+) -> list[dict]:
+    """
+    Trenches 接口（仅 sol/bsc/base 支持，eth 不支持）。
+
+    type 三种：new_creation / near_completion / completed
+    我们破灭法目主要用 'completed'（已毕业的币，通常已上 DEX，市值更稳定）。
+
+    返回结构是按 type 分组的字典：{"new_creation":[...], "near_completion":[...], "completed":[...]}
+    我们只关心传入的那种 type。
+    """
+    args = [
+        "market", "trenches",
+        "--chain", chain,
+        "--type", type_,
+        "--limit", str(limit),
+    ]
+    data = _run(args)
+    if isinstance(data, dict):
+        # 兼容两种返回格式：分组字典 / 直接列表
+        if type_ in data:
+            return data[type_] or []
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+        return []
+    if isinstance(data, list):
+        return data
+    return []
+

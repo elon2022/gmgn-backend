@@ -16,6 +16,7 @@ import accumulation
 import gmgn_client
 import holdings as holdings_agg
 import refresh as refresh_mod
+import watchlist as watchlist_mod   # 关注池操作
 
 API_TOKEN = os.environ.get("API_TOKEN", "dev-token-change-me")
 
@@ -558,3 +559,138 @@ def manual_refresh(
         return {"ok": True, "saved": n, "chain": chain}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+# ---------- 破灭法目 / 雷达 v2 ----------
+@app.get("/api/v1/radar_v2/signals")
+def radar_v2_signals(
+    hours: int = Query(72, ge=1, le=336, description="回溯多少小时的信号"),
+    chain: str | None = Query(None, description="可选：只返回某条链"),
+    kind: str | None = Query(None, description="可选：'B' / 'C' / 'E1' / 'E2'"),
+    limit: int = Query(200, ge=1, le=1000),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    """破灭法目信号列表，按时间倒序。"""
+    require_auth(authorization)
+
+    sql = """
+        SELECT id, chain, address, triggered_at, signal_kind,
+               current_price, current_mc, liquidity_usd,
+               multiplier_24h, price_24h_low, price_24h_low_at,
+               peak_mc_7d, peak_price_7d, peak_at, drawdown_pct,
+               symbol, name, logo_url, is_honeypot, holder_count, source
+          FROM radar_v2_signals
+         WHERE triggered_at >= datetime('now', ?)
+    """
+    params: list[Any] = [f"-{hours} hours"]
+
+    if chain:
+        sql += " AND chain = ?"
+        params.append(chain)
+    if kind:
+        sql += " AND signal_kind = ?"
+        params.append(kind)
+
+    sql += " ORDER BY triggered_at DESC LIMIT ?"
+    params.append(limit)
+
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    signals = [
+        {
+            "id": r["id"],
+            "chain": r["chain"],
+            "address": r["address"],
+            "triggered_at": r["triggered_at"],
+            "signal_kind": r["signal_kind"],
+            "current_price": r["current_price"],
+            "current_mc": r["current_mc"],
+            "liquidity_usd": r["liquidity_usd"],
+            "multiplier_24h": r["multiplier_24h"],
+            "price_24h_low": r["price_24h_low"],
+            "price_24h_low_at": r["price_24h_low_at"],
+            "peak_mc_7d": r["peak_mc_7d"],
+            "peak_price_7d": r["peak_price_7d"],
+            "peak_at": r["peak_at"],
+            "drawdown_pct": r["drawdown_pct"],
+            "symbol": r["symbol"],
+            "name": r["name"],
+            "logo_url": r["logo_url"],
+            "is_honeypot": bool(r["is_honeypot"]) if r["is_honeypot"] is not None else None,
+            "holder_count": r["holder_count"],
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+
+    return {
+        "hours": hours,
+        "chain": chain,
+        "kind": kind,
+        "count": len(signals),
+        "signals": signals,
+    }
+
+
+# ---------- 关注池 ----------
+class WatchlistAddRequest(BaseModel):
+    chain: str = Field(..., description="eth / sol / bsc / base")
+    address: str = Field(..., description="代币合约地址")
+    notes: str | None = None
+
+
+class WatchlistRemoveRequest(BaseModel):
+    chain: str
+    address: str
+
+
+@app.get("/api/v1/watchlist")
+def watchlist_list(
+    chain: str | None = Query(None),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with db() as conn:
+        items = watchlist_mod.list_all(conn, chain=chain)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/v1/watchlist/add")
+def watchlist_add(
+    req: WatchlistAddRequest,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with db() as conn:
+        result = watchlist_mod.add(conn, req.chain, req.address, req.notes)
+    return {"ok": True, "item": result}
+
+
+@app.post("/api/v1/watchlist/remove")
+def watchlist_remove(
+    req: WatchlistRemoveRequest,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with db() as conn:
+        ok = watchlist_mod.remove(conn, req.chain, req.address)
+    return {"ok": ok}
+
+
+@app.get("/api/v1/watchlist/check")
+def watchlist_check(
+    chain: str = Query(...),
+    address: str = Query(...),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    """详情页用：检查这个币是否在关注池里（用于显示星标状态）。"""
+    require_auth(authorization)
+    with db() as conn:
+        watched = watchlist_mod.is_watched(conn, chain, address)
+    return {"watched": watched}
