@@ -694,3 +694,42 @@ def watchlist_check(
     with db() as conn:
         watched = watchlist_mod.is_watched(conn, chain, address)
     return {"watched": watched}
+
+
+
+@app.get("/api/v1/storage_bag/signals")
+def storage_bag_signals(
+    hours: int = Query(168, ge=1, le=720, description="回溯多少小时"),
+    chain: str | None = Query(None),
+    kind: str | None = Query(None, description="UP_50 / UP_200 / DOWN_50 / STABILIZED"),
+    limit: int = Query(200, ge=1, le=1000),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    """储物袋历史信号列表，按时间倒序。"""
+    require_auth(authorization)
+
+    sql = """
+        SELECT id, chain, address, triggered_at, signal_kind,
+               entry_price, entry_mc, entry_at,
+               current_price, current_mc, pct_change,
+               peak_price, peak_pct, min_price, min_pct,
+               symbol, name, logo_url
+          FROM storage_bag_signals
+         WHERE triggered_at >= datetime('now', ?)
+    """
+    params: list[Any] = [f"-{hours} hours"]
+    if chain:
+        sql += " AND chain = ?"
+        params.append(chain)
+    if kind:
+        sql += " AND signal_kind = ?"
+        params.append(kind)
+    sql += " ORDER BY triggered_at DESC LIMIT ?"
+    params.append(limit)
+
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    signals = [dict(r) for r in rows]
+    return {"hours": hours, "chain": chain, "kind": kind,
+            "count": len(signals), "signals": signals}

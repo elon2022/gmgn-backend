@@ -33,7 +33,14 @@ def init_db() -> sqlite3.Connection:
     v2_schema_path = BASE_DIR / "schema_v2.sql"
     if v2_schema_path.exists():
         conn.executescript(v2_schema_path.read_text())
+
+    # ---- 加载储物袋 schema patch ----
+    sb_schema_path = BASE_DIR / "schema_v2_patch.sql"
+    if sb_schema_path.exists():
+        conn.executescript(sb_schema_path.read_text())
+
     _migrate_old_db(conn)
+    _migrate_watched_tokens(conn)  # ← 新增
     return conn
 
 
@@ -50,6 +57,26 @@ def _migrate_old_db(conn: sqlite3.Connection) -> None:
             print("[migrate] radar_signals: added column peak_market_cap")
         except sqlite3.OperationalError as e:
             print(f"[migrate] failed to add peak_market_cap: {e}")
+
+def _migrate_watched_tokens(conn: sqlite3.Connection) -> None:
+    """
+    watched_tokens 旧库可能没有 entry_* 字段，检测并补加。
+    SQLite ADD COLUMN 不支持 IF NOT EXISTS，必须显式检测。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(watched_tokens)").fetchall()}
+    for col_def in [
+        ("entry_price", "REAL"),
+        ("entry_mc", "REAL"),
+        ("entry_at", "TEXT"),
+    ]:
+        col_name, col_type = col_def
+        if col_name not in cols:
+            try:
+                conn.execute(f"ALTER TABLE watched_tokens ADD COLUMN {col_name} {col_type}")
+                conn.commit()
+                print(f"[migrate] watched_tokens: added column {col_name}")
+            except sqlite3.OperationalError as e:
+                print(f"[migrate] failed to add {col_name}: {e}")
 
 
 def upsert_token(conn: sqlite3.Connection, item: dict, ts: str) -> None:
@@ -209,6 +236,16 @@ def refresh_all(
                 print(f"---- radar_v2 [破灭法目]: {total_v2} new signals ----")
             except Exception as e:
                 print(f"[radar_v2] scan failed: {type(e).__name__}: {e}")
+
+            # ===== 储物袋（新增 v3）=====
+            try:
+                import storage_bag
+                sb_stats = storage_bag.scan_all(conn)
+                n_total = sb_stats.get("UP_50", 0) + sb_stats.get("UP_200", 0) \
+                          + sb_stats.get("DOWN_50", 0) + sb_stats.get("STABILIZED", 0)
+                print(f"---- storage_bag [储物袋]: {n_total} new signals ----")
+            except Exception as e:
+                print(f"[storage_bag] scan failed: {type(e).__name__}: {e}")
 
     finally:
         conn.close()
