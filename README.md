@@ -2,6 +2,11 @@
 
 iPhone App 的后端，调 `gmgn-cli` 拉行情数据并提供 HTTP 接口。
 
+
+var baseURL: String = "http://192.168.0.103:8000"
+
+var token: String = "dev-token-change-me"
+
 ## 前置条件
 
 - macOS / Linux
@@ -32,6 +37,14 @@ cp .env.example .env
 ## 第一次跑
 
 ```bash
+
+cd ~/gmgn-backend
+/Users/liuyangyang/gmgn-backend
+
+source venv/bin/activate
+
+pip install -r requirements.txt
+
 # 1. 手动拉一次数据，验证链路通了
 python3 refresh.py eth
 # 应该看到：[2026-05-03T10:35:00+00:00] saved 50 tokens for chain=eth interval=5m
@@ -41,6 +54,18 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 # 3. 健康检查
 curl http://localhost:8000/healthz
+
+# 详情接口（拿一个 trending 列表里的真实地址）
+# 先看 trending 第一条的地址：
+curl -s -H "Authorization: Bearer dev-token-change-me" \
+  "http://localhost:8000/api/v1/trending?chain=eth&limit=1" \
+  | python3 -m json.tool
+
+# 假设上面输出的第一个地址是 0xABCDEF...
+# 测详情接口：
+curl -s -H "Authorization: Bearer dev-token-change-me" \
+  "http://localhost:8000/api/v1/token/eth/0x44b28991b167582f18ba0259e0173176ca125505" \
+  | python3 -m json.tool
 ```
 
 ## 让 iPhone 访问
