@@ -7,7 +7,9 @@
   📉 DOWN_50    跌 ≥ 50%
   🪨 STABILIZED 止跌企稳：曾跌 ≥ 50% + 24h 不再创新低 + 反弹 5% + 流动性 ≥ $20K + 成交量回升
 
-每个币每次扫描可能触发多档（比如同时 UP_50 和 UP_200），都各自判 cooldown 后入库。
+每个币每次扫描可能触发多档（比如同时 UP_50 和 UP_200）。
+触发后 cooldown 期内不写新信号，但每次扫描会更新现有信号的 pct_change / peak / min
+等实时字段，让 iOS 列表始终显示"自入场以来的最新状态"。
 """
 import sqlite3
 import time
@@ -301,12 +303,86 @@ def _save_signal(
     )
 
 
+def _update_latest_signal(
+    conn: sqlite3.Connection,
+    chain: str,
+    address: str,
+    signal_kind: str,
+    metrics: dict,
+    current_mc: float | None,
+) -> None:
+    """
+    Cooldown 期内不写新信号，但更新现有最新信号的实时数据
+    （当前价、当前 pct、新的 peak、新的 min）。
+
+    设计目的：让储物袋列表始终显示"自入场以来的最新状态"，
+    而不是"触发那一刻的快照"。
+
+    peak / min 取历史极值（不是"现在的"peak）：
+    新算出的 peak 比库里的高就替换，否则保留旧值；min 同理。
+    """
+    row = conn.execute(
+        """
+        SELECT id, peak_price, peak_pct, min_price, min_pct
+          FROM storage_bag_signals
+         WHERE chain = ? AND address = ? AND signal_kind = ?
+         ORDER BY triggered_at DESC LIMIT 1
+        """,
+        (chain, address, signal_kind),
+    ).fetchone()
+    if not row:
+        return
+
+    # 取已有 peak / min 和新算出的对比，保留极值
+    new_peak_price = metrics.get("peak_price")
+    new_peak_pct = metrics.get("peak_pct")
+    new_min_price = metrics.get("min_price")
+    new_min_pct = metrics.get("min_pct")
+
+    keep_peak_price = row["peak_price"]
+    keep_peak_pct = row["peak_pct"]
+    if new_peak_price is not None and (keep_peak_price is None or new_peak_price > keep_peak_price):
+        keep_peak_price = new_peak_price
+        keep_peak_pct = new_peak_pct
+
+    keep_min_price = row["min_price"]
+    keep_min_pct = row["min_pct"]
+    if new_min_price is not None and (keep_min_price is None or new_min_price < keep_min_price):
+        keep_min_price = new_min_price
+        keep_min_pct = new_min_pct
+
+    conn.execute(
+        """
+        UPDATE storage_bag_signals
+           SET current_price = ?,
+               current_mc = ?,
+               pct_change = ?,
+               peak_price = ?,
+               peak_pct = ?,
+               min_price = ?,
+               min_pct = ?
+         WHERE id = ?
+        """,
+        (
+            metrics.get("current_price"),
+            current_mc,
+            metrics.get("pct_change"),
+            keep_peak_price,
+            keep_peak_pct,
+            keep_min_price,
+            keep_min_pct,
+            row["id"],
+        ),
+    )
+
+
 def scan_all(conn: sqlite3.Connection) -> dict[str, int]:
     """
     扫描所有储物袋代币。
     每 10 分钟由 refresh.py 调用一次。
     """
     stats = {"UP_50": 0, "UP_200": 0, "DOWN_50": 0, "STABILIZED": 0,
+             "updated": 0,    # cooldown 内被刷新的信号数
              "watched_total": 0, "kline_ok": 0, "kline_fail": 0,
              "skipped_no_entry": 0, "skipped_too_new": 0}
 
@@ -380,6 +456,9 @@ def scan_all(conn: sqlite3.Connection) -> dict[str, int]:
         for kind in metrics["triggered"]:
             cooldown_h = SIGNAL_RULES[kind]["cooldown_hours"]
             if _is_in_cooldown(conn, chain, address, kind, cooldown_h):
+                # cooldown 内：不写新信号，但更新现有信号的实时数据
+                _update_latest_signal(conn, chain, address, kind, metrics, cur_mc)
+                stats["updated"] += 1
                 continue
             _save_signal(conn, watched, metrics, cur_mc, kind)
             stats[kind] += 1
@@ -390,6 +469,7 @@ def scan_all(conn: sqlite3.Connection) -> dict[str, int]:
         f"[storage_bag] watched={stats['watched_total']} "
         f"kline_ok={stats['kline_ok']} fail={stats['kline_fail']} "
         f"skip_no_entry={stats['skipped_no_entry']} skip_new={stats['skipped_too_new']} | "
-        f"signals: 🚀={stats['UP_50']} 🚀🚀={stats['UP_200']} 📉={stats['DOWN_50']} 🪨={stats['STABILIZED']} (total {n_total})"
+        f"new: 🚀={stats['UP_50']} 🚀🚀={stats['UP_200']} 📉={stats['DOWN_50']} 🪨={stats['STABILIZED']} (total {n_total}) "
+        f"updated={stats['updated']}"
     )
     return stats
