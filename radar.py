@@ -13,7 +13,7 @@
    - trigger_pct 是涨幅正数
 
 2. 回溯型（scan_rebounds）：高位币跌回小市值机会区
-   双轨：
+   双轨:
    - "rebound_major"（大饱饱）：历史高点 ≥ $5M
    - "rebound_minor"（潜伏）：历史高点 $1M-$5M
    共同条件：
@@ -26,11 +26,36 @@
    - trigger_pct 存"距高点的回撤百分比"，负数（如 -65 表示跌了 65%）
    - peak_market_cap 字段存历史高点（iOS 显示「高点 $X → 现 $Y」用）
 
+发射台后缀白名单（_passes_suffix_filter）：
+   - SOL: 只保留 pump / BAGS 结尾
+   - BSC: 只保留 4444 / 7777 结尾（four.meme / 蝴蝶平台）
+   - ETH / Base: 不过滤
+
 由 refresh.py 在每次刷新所有链之后调用一次。
 """
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+# ---------- 发射台后缀白名单 ----------
+SOL_SAFE_SUFFIXES = ("pump", "BAGS")
+BSC_SAFE_SUFFIXES = ("4444", "7777")    # four.meme / 蝴蝶平台
+
+
+def _passes_suffix_filter(chain: str, address: str) -> bool:
+    """
+    按链应用发射台后缀白名单。
+    - SOL: 只保留 pump / BAGS 结尾（区分大小写）
+    - BSC: 只保留 4444 / 7777 结尾（EVM 不区分大小写，统一小写比较）
+    - 其他链（ETH/Base）：不过滤
+    """
+    if chain == "sol":
+        return any(address.endswith(suf) for suf in SOL_SAFE_SUFFIXES)
+    if chain == "bsc":
+        addr_lower = address.lower()
+        return any(addr_lower.endswith(suf) for suf in BSC_SAFE_SUFFIXES)
+    return True
+
 
 # 暴涨型配置
 CONFIG = {
@@ -158,6 +183,10 @@ def scan_and_save(conn: sqlite3.Connection, chain: str) -> list[dict]:
 
     triggered = []
     for curr in current_rows:
+        # 0. 发射台后缀白名单（sol/bsc）
+        if not _passes_suffix_filter(chain, curr["address"]):
+            continue
+
         # 3. 市值过滤
         mc = curr["market_cap"]
         if mc is None or not (CONFIG["market_cap_min"] <= mc <= CONFIG["market_cap_max"]):
@@ -350,6 +379,11 @@ def scan_rebounds(conn: sqlite3.Connection, chain: str) -> list[dict]:
     triggered = []
     for curr in current_rows:
         addr = curr["address"]
+
+        # 0. 发射台后缀白名单（sol/bsc）
+        if not _passes_suffix_filter(chain, addr):
+            continue
+
         mc = curr["market_cap"]
 
         # 3. 当前市值范围过滤

@@ -7,6 +7,12 @@
   - watched_tokens（用户关注池，所有链）
 
 合并去重 + 轻量过滤后返回候选列表。
+
+发射台后缀白名单（与 radar.py 口径保持一致）：
+  - SOL: 只保留 pump / BAGS 结尾
+  - BSC: 只保留 4444 / 7777 结尾（four.meme / 蝴蝶平台）
+  - ETH / Base: 不过滤
+  - 用户关注池（watchlist 来源）：永远豁免
 """
 import sqlite3
 from typing import Any
@@ -21,6 +27,34 @@ TRENCHES_SUPPORTED_CHAINS = {"sol", "bsc", "base"}
 CANDIDATE_MC_MIN = 200_000
 CANDIDATE_MC_MAX = 50_000_000
 CANDIDATE_LIQ_MIN = 20_000
+
+# ---------- 发射台后缀白名单 ----------
+SOL_SAFE_SUFFIXES = ("pump", "BAGS")
+BSC_SAFE_SUFFIXES = ("4444", "7777")    # four.meme / 蝴蝶平台
+
+
+def _passes_suffix_filter(c: dict) -> bool:
+    """
+    按链应用发射台后缀白名单。
+    - SOL: 只保留 pump / BAGS 结尾（区分大小写）
+    - BSC: 只保留 4444 / 7777 结尾（EVM 统一小写比较）
+    - 其他链（ETH/Base）：不过滤
+    - 用户关注池里的币豁免（永远纳入）
+    """
+    chain = c.get("chain")
+
+    # 用户关注池豁免
+    source = c.get("source") or ""
+    if "watchlist" in source:
+        return True
+
+    if chain == "sol":
+        addr = c.get("address", "")
+        return any(addr.endswith(suf) for suf in SOL_SAFE_SUFFIXES)
+    if chain == "bsc":
+        addr = (c.get("address") or "").lower()
+        return any(addr.endswith(suf) for suf in BSC_SAFE_SUFFIXES)
+    return True
 
 
 def _to_float(v: Any) -> float | None:
@@ -178,31 +212,8 @@ def build_candidates(conn: sqlite3.Connection, chain: str) -> list[dict]:
             candidates.append(c)
         elif _passes_filter(c):
             candidates.append(c)
-    candidates = [c for c in candidates if _passes_sol_suffix_filter(c)]
+
+    # 发射台后缀白名单过滤（其他链直接放行；watchlist 来源也豁免）
+    candidates = [c for c in candidates if _passes_suffix_filter(c)]
+
     return candidates
-
-
-
-
-# radar_v2_candidates.py 末尾追加一个过滤函数
-
-# SOL 上"安全后缀"白名单
-SOL_SAFE_SUFFIXES = ("pump", "BAGS")
-
-def _passes_sol_suffix_filter(c: dict) -> bool:
-    """
-    SOL 链：只保留 pump / BAGS 结尾的代币。
-    用户关注池里的不过滤（永远纳入）。
-    其他链不受影响。
-    """
-    if c["chain"] != "sol":
-        return True
-
-    # watchlist 来源的币豁免
-    source = c.get("source", "")
-    if "watchlist" in source:
-        return True
-
-    # 检查后缀（地址区分大小写，但后缀检查保险起见两种都试）
-    addr = c.get("address", "")
-    return any(addr.endswith(suf) for suf in SOL_SAFE_SUFFIXES)
